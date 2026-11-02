@@ -1,0 +1,5 @@
+P3
+# maxval 100: values are scaled to 0..255 when loaded
+3 1
+100
+100 0 0  0 100 0  0 0 100

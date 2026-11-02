@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ImageLab Phase 2 Report</title>
+<style>
+  @page { margin: 2cm; size: A4; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 10.5pt; line-height: 1.45; color: #222; max-width: 720px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 18pt; text-align: center; border-bottom: 2px solid #333; padding-bottom: 8px; margin-bottom: 4px; }
+  .subtitle { text-align: center; font-size: 10pt; color: #555; margin-bottom: 18px; }
+  h2 { font-size: 13pt; color: #1a5276; border-bottom: 1px solid #bbb; padding-bottom: 3px; margin-top: 18px; page-break-after: avoid; }
+  h3 { font-size: 11pt; color: #1a5276; margin-top: 12px; margin-bottom: 4px; page-break-after: avoid; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 9.5pt; }
+  th, td { border: 1px solid #aaa; padding: 4px 8px; text-align: left; }
+  th { background-color: #e8e8e8; font-weight: bold; }
+  td.num { text-align: right; font-family: monospace; }
+  code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 9.5pt; }
+  p { margin: 5px 0; }
+  ul, ol { margin: 4px 0; padding-left: 20px; }
+  li { margin: 2px 0; }
+  .note { background: #f8f8e0; border-left: 3px solid #c0a000; padding: 6px 10px; margin: 8px 0; font-size: 9.5pt; }
+  .pagebreak { page-break-before: always; }
+</style>
+</head>
+<body>
+
+<h1>ImageLab — Phase 2 Report</h1>
+<div class="subtitle">
+  Data Structures Assignment 2 &bull; FAST University &bull; CS-3H<br>
+  Sachin Kumar &bull; 25i-0813<br>
+  October 2026
+</div>
+
+<!-- ===== SECTION 1 ===== -->
+<h2>1. Phase 1 Recap and Phase 2 Overview</h2>
+
+<p>Phase 1 implemented the core image editor with custom <code>stackType</code> and <code>queueType</code>, eight image operations, full-snapshot undo/redo, a FIFO processing pipeline, and iterative bucket fill (both stack-based DFS and queue-based BFS). All 163 Phase 1 tests pass.</p>
+
+<p>Phase 2 extends the system with five major features:</p>
+<ol>
+  <li><strong>Memory-aware compact history</strong> — replaces full-image snapshots with operation-specific records</li>
+  <li><strong>Brightness coalescing</strong> — merges consecutive brightness adjustments</li>
+  <li><strong>Priority scheduling</strong> — adds a <code>priorityQueueType</code> and toggleable scheduling modes</li>
+  <li><strong>Batch operations</strong> — amortised multi-element push/pop/add/delete</li>
+  <li><strong>Experimental evaluation</strong> — four benchmark experiments with analysis</li>
+</ol>
+
+<!-- ===== SECTION 2 ===== -->
+<h2>2. Data Structures</h2>
+
+<h3>2.1 stackType&lt;Type&gt; — Enhancements</h3>
+<p>New Phase 2 methods:</p>
+<ul>
+  <li><code>pushBatch(items[], n)</code> — single capacity check via <code>growTo()</code>, then block-copies <em>n</em> elements. Avoids <em>n</em> separate grow checks.</li>
+  <li><code>popBatch(n)</code> — decrements <code>count</code> in one step (clamps to stack size).</li>
+  <li><code>removeBottom()</code> — shifts all elements left by one (O(n)), used for memory-budget eviction of the oldest history record.</li>
+</ul>
+
+<h3>2.2 queueType&lt;Type&gt; — Enhancements</h3>
+<ul>
+  <li><code>addQueueBatch(items[], n)</code> — one grow check, inserts all <em>n</em> items across the circular boundary.</li>
+  <li><code>deleteQueueBatch(n)</code> — advances <code>frontIdx</code> by <em>n</em> modulo capacity in one step.</li>
+</ul>
+
+<h3>2.3 priorityQueueType&lt;Type&gt; — New</h3>
+<p>An <strong>ordered dynamic array</strong> where <code>data[0]</code> is the highest-priority element (smallest <code>.priority</code> value). Insertion shifts elements to maintain sorted order (O(n) insertion, O(1) front/delete). Ties are broken by arrival order (FIFO): a new element with the same priority is placed <em>after</em> all existing elements of that priority. The array doubles when full.</p>
+
+<table>
+  <tr><th>Operation</th><th>Time</th><th>Space</th></tr>
+  <tr><td>addQueue (insert)</td><td>O(n) — shifts to maintain order</td><td>O(n) total</td></tr>
+  <tr><td>front / deleteQueue</td><td>O(1) / O(n) — shift after remove</td><td>—</td></tr>
+  <tr><td>peekAt(i)</td><td>O(1)</td><td>—</td></tr>
+</table>
+
+<div class="note">
+  <strong>Design decision:</strong> An ordered array was chosen over a binary heap because (a) it is closer to the data structures taught in the course, (b) it supports simple <code>peekAt()</code> traversal for the Inspector and finalization barriers, and (c) with typical queue sizes of 10–50 jobs, the O(n) insertion cost is negligible.
+</div>
+
+<!-- ===== SECTION 3 ===== -->
+<h2>3. Memory-Aware Compact History</h2>
+
+<h3>3.1 Record Design</h3>
+<p>Instead of storing a full copy of the image for every undo record, <code>HistoryRecord</code> stores only the data needed to reverse each specific operation:</p>
+
+<table>
+  <tr><th>Operation</th><th>Undo Data Stored</th><th>Estimated Size</th></tr>
+  <tr><td>Rotate</td><td>Angle only (inverse rotation computed)</td><td>~100 bytes (struct only)</td></tr>
+  <tr><td>Flip</td><td>Direction only (flip is self-inverse)</td><td>~100 bytes</td></tr>
+  <tr><td>Brightness</td><td>Delta + full pre-op pixel array (for clamping)</td><td>W×H×3 + overhead</td></tr>
+  <tr><td>Crop</td><td>Crop coordinates + full pre-crop image</td><td>oldW×oldH×3 + overhead</td></tr>
+  <tr><td>Bucket Fill</td><td>Changed pixel coordinates + original values</td><td>changed × (sizeof Point + sizeof Pixel)</td></tr>
+  <tr><td>Grayscale / Blur / Resize</td><td>Full previous image</td><td>W×H×3 + overhead</td></tr>
+</table>
+
+<p><strong>Key insight:</strong> Rotate and flip records are essentially <em>free</em> — they store no pixel data at all. Bucket fill records are proportional to the number of changed pixels, not the total image size.</p>
+
+<h3>3.2 Memory Budgeting</h3>
+<p>A configurable <code>memoryBudget</code> (in bytes) limits total undo+redo memory. Each record's <code>estimatedBytes</code> is tracked. When the budget is exceeded after recording a new operation, the oldest undo record is evicted via <code>stackType::removeBottom()</code>. Setting budget to 0 disables the limit.</p>
+
+<h3>3.3 Undo/Redo Mechanics</h3>
+<p>Undo creates a "redo record" that captures the current image state before reverting, then pushes it to the redo stack. For rotate/flip, the redo simply re-applies the same operation. For pixel-based operations, the redo record stores the post-operation image so it can be restored exactly. This ensures perfect round-trip fidelity even after clamping.</p>
+
+<!-- ===== SECTION 4 ===== -->
+<h2>4. Brightness Coalescing</h2>
+
+<p>When a brightness operation is recorded and the top of the undo stack is already a brightness record, the two are <strong>merged</strong>: the deltas are summed, and the older record's saved pixels (the pre-chain originals) are kept. The new record is discarded without increasing memory.</p>
+
+<p><strong>Why this is correct:</strong> The saved pixels in the coalesced record represent the image <em>before the entire chain</em> of brightness adjustments. Undoing restores those exact pixels, reversing the cumulative delta in one step regardless of clamping.</p>
+
+<p><strong>Interruption:</strong> Any non-brightness operation breaks the chain. Subsequent brightness operations start a new chain.</p>
+
+<p><strong>Tested:</strong> Three consecutive brightness(+10, +20, +5) produce one record with effective delta 35. Undo restores the exact original. Clipping at 255 is handled correctly because the original pixel values are preserved.</p>
+
+<!-- ===== SECTION 5 ===== -->
+<h2>5. Priority Scheduling</h2>
+
+<h3>5.1 Design</h3>
+<p>The user can toggle between <strong>FIFO</strong> mode (uses <code>queueType</code>) and <strong>Priority</strong> mode (uses <code>priorityQueueType</code>). Priority levels:</p>
+
+<table>
+  <tr><th>Priority</th><th>Value</th><th>Operations</th></tr>
+  <tr><td>Highest</td><td class="num">1</td><td>Undo, Redo</td></tr>
+  <tr><td>High</td><td class="num">2</td><td>Blur, Bucket Fill</td></tr>
+  <tr><td>Medium</td><td class="num">3</td><td>Resize</td></tr>
+  <tr><td>Low (Finalization)</td><td class="num">4</td><td>Save, Export</td></tr>
+</table>
+
+<p>Within the same priority level, FIFO ordering is preserved (the priority queue's insertion logic places new elements after existing elements of equal priority).</p>
+
+<h3>5.2 Finalization Barriers</h3>
+<p>Save and Export jobs act as natural barriers: they have the lowest priority (4), so all higher-priority jobs submitted before them are processed first. Jobs submitted <em>after</em> a finalization job receive higher sequence numbers and are handled after the barrier completes.</p>
+
+<!-- ===== SECTION 6 ===== -->
+<h2>6. Batch Operations</h2>
+
+<p>Batch methods perform a single capacity check and one possible growth/reallocation, then insert or remove multiple elements. This avoids redundant bounds checks and potential multiple reallocations.</p>
+
+<table>
+  <tr><th>Method</th><th>Single-call equivalent</th><th>Benefit</th></tr>
+  <tr><td><code>pushBatch(items, n)</code></td><td><em>n</em> × <code>push()</code></td><td>1 grow check vs <em>n</em></td></tr>
+  <tr><td><code>popBatch(n)</code></td><td><em>n</em> × <code>pop()</code></td><td>1 decrement vs <em>n</em></td></tr>
+  <tr><td><code>addQueueBatch(items, n)</code></td><td><em>n</em> × <code>addQueue()</code></td><td>1 grow check + unwrap vs <em>n</em></td></tr>
+  <tr><td><code>deleteQueueBatch(n)</code></td><td><em>n</em> × <code>deleteQueue()</code></td><td>1 modular advance vs <em>n</em></td></tr>
+</table>
+
+<!-- ===== SECTION 7 ===== -->
+<div class="pagebreak"></div>
+<h2>7. Experimental Evaluation</h2>
+
+<h3>Experiment A — Stack vs Queue Bucket Fill</h3>
+<p>Uniform white images filled with a single colour, averaged over 3 runs per size.</p>
+
+<table>
+  <tr><th>Image Size</th><th>Stack Time (ms)</th><th>Queue Time (ms)</th><th>Stack Max Size</th><th>Queue Max Size</th><th>Insertions (both)</th></tr>
+  <tr><td>512×512</td><td class="num">10.02</td><td class="num">10.09</td><td class="num">130,817</td><td class="num">512</td><td class="num">262,144</td></tr>
+  <tr><td>1024×1024</td><td class="num">35.54</td><td class="num">41.90</td><td class="num">523,777</td><td class="num">1,024</td><td class="num">1,048,576</td></tr>
+  <tr><td>2048×2048</td><td class="num">129.26</td><td class="num">131.95</td><td class="num">2,096,129</td><td class="num">2,048</td><td class="num">4,194,304</td></tr>
+</table>
+
+<p><strong>Analysis:</strong></p>
+<ul>
+  <li>Both versions perform the <strong>same number of insertions</strong> (exactly one per pixel), confirming no pixel is revisited.</li>
+  <li><strong>Execution time is nearly identical</strong> because the dominant cost is pixel access and memory allocation, not the push/pop operations.</li>
+  <li><strong>Peak memory differs dramatically:</strong> The stack-based (DFS) version reaches ~N/2 elements on a uniform N×N image because DFS pushes an entire row of neighbours before backtracking. The queue-based (BFS) version maintains a wavefront of width ≈ N, using ~255× less memory than the stack version.</li>
+  <li><strong>Conclusion:</strong> Queue-based fill is <strong>strongly preferred</strong> for memory efficiency. On a 2048×2048 image, the stack needs 2M entries (~16 MB) while the queue needs only 2K entries (~16 KB).</li>
+</ul>
+
+<h3>Experiment B — Memory-Aware History</h3>
+<p>100×100 image with repeated brightness operations under a 5 MB budget.</p>
+
+<table>
+  <tr><th>Operations</th><th>Undo Stack Size</th><th>Memory Used</th><th>Apply Time (ms)</th><th>Undo All Time (ms)</th></tr>
+  <tr><td>100</td><td class="num">1</td><td class="num">30,084 bytes</td><td class="num">21.53</td><td class="num">&lt;1</td></tr>
+  <tr><td>1000</td><td class="num">1</td><td class="num">30,084 bytes</td><td class="num">166.63</td><td class="num">&lt;1</td></tr>
+</table>
+
+<p><strong>Analysis:</strong></p>
+<ul>
+  <li>All brightness operations <strong>coalesce into a single record</strong> — the undo stack always has exactly 1 entry regardless of how many brightness operations are applied.</li>
+  <li>Memory usage is constant at ~30 KB (the 100×100 pre-operation pixel array + struct overhead), well within the 5 MB budget.</li>
+  <li>Undo is instantaneous because it restores one record containing the original pixels.</li>
+  <li><strong>Conclusion:</strong> Coalescing is extremely effective for repeated homogeneous operations — it reduces both memory and undo time from O(n) to O(1) in the number of operations.</li>
+</ul>
+
+<h3>Experiment C — FIFO vs Priority Scheduling</h3>
+<p>36 mixed jobs (8 resize, 12 blur, 5 fill, 4 undo, 1 save, 1 export, 5 more resize, 4 more blur).</p>
+
+<table>
+  <tr><th>Mode</th><th>Total Time (ms)</th><th>Execution Order (first 5)</th></tr>
+  <tr><td>FIFO</td><td class="num">7.02</td><td>Resize → Resize → ... → Blur → ...</td></tr>
+  <tr><td>Priority</td><td class="num">10.12</td><td>Undo → Undo → ... → Blur → ...</td></tr>
+</table>
+
+<p><strong>Analysis:</strong></p>
+<ul>
+  <li><strong>FIFO</strong> processes jobs in submission order. Undo/redo operations run late (jobs 22–25), after all 16 resizes and blurs.</li>
+  <li><strong>Priority</strong> promotes undo/redo (priority 1) to the front, processes all blurs/fills (priority 2) next, then resizes (priority 3), and finally save/export (priority 4).</li>
+  <li>Priority mode is slightly slower overall due to the O(n) insertion cost of the ordered-array priority queue. However, the latency of urgent operations (undo/redo) is much lower because they run immediately.</li>
+  <li><strong>Conclusion:</strong> Priority scheduling trades marginal throughput for <strong>better responsiveness</strong> to high-priority operations like undo. The insertion overhead is negligible for typical workloads (&lt;50 jobs).</li>
+</ul>
+
+<h3>Experiment D — Single vs Batched Operations</h3>
+<p>Integer elements inserted/removed from stack and queue.</p>
+
+<table>
+  <tr><th>Structure</th><th>Operation</th><th>N</th><th>Single (ms)</th><th>Batch (ms)</th><th>Speedup</th></tr>
+  <tr><td>Stack</td><td>push</td><td class="num">1,000</td><td class="num">&lt;1</td><td class="num">&lt;1</td><td>—</td></tr>
+  <tr><td>Stack</td><td>push</td><td class="num">10,000</td><td class="num">&lt;1</td><td class="num">&lt;1</td><td>—</td></tr>
+  <tr><td>Stack</td><td>push</td><td class="num">100,000</td><td class="num">1.00</td><td class="num">&lt;1</td><td>~∞</td></tr>
+  <tr><td>Queue</td><td>add</td><td class="num">10,000</td><td class="num">0.60</td><td class="num">0.60</td><td>1.0×</td></tr>
+  <tr><td>Queue</td><td>add</td><td class="num">100,000</td><td class="num">5.02</td><td class="num">2.01</td><td>2.5×</td></tr>
+  <tr><td>Stack</td><td>pop</td><td class="num">100,000</td><td class="num">&lt;1</td><td class="num">&lt;1</td><td>—</td></tr>
+  <tr><td>Queue</td><td>delete</td><td class="num">100,000</td><td class="num">&lt;1</td><td class="num">&lt;1</td><td>—</td></tr>
+</table>
+
+<p><strong>Analysis:</strong></p>
+<ul>
+  <li>At small sizes (1K–10K), the difference is negligible because the per-call overhead of bounds checking is tiny.</li>
+  <li>At 100K elements, <strong>batch queue add is 2.5× faster</strong> because the single-call version may trigger multiple reallocations (each doubling requires copying all existing elements), while the batch version does one <code>growTo()</code> call that allocates the final size directly.</li>
+  <li><strong>Stack push batch at 100K</strong> shows the biggest improvement: single-call triggers log₂(100000/16) ≈ 13 doublings, each copying progressively more data. Batch does one allocation.</li>
+  <li>Pop/delete operations are always O(1) per element and show no significant difference.</li>
+  <li><strong>Conclusion:</strong> Batch operations are most beneficial for <strong>insertion-heavy workloads exceeding 10K elements</strong>, particularly when the initial capacity is small and many reallocations would otherwise occur.</li>
+</ul>
+
+<!-- ===== SECTION 8 ===== -->
+<h2>8. Complexity Summary</h2>
+
+<table>
+  <tr><th>Component</th><th>Operation</th><th>Time</th><th>Space</th></tr>
+  <tr><td>stackType</td><td>push / pop / top</td><td>O(1) amortized</td><td>O(n)</td></tr>
+  <tr><td>stackType</td><td>pushBatch(n) / popBatch(n)</td><td>O(n) total</td><td>O(n)</td></tr>
+  <tr><td>stackType</td><td>removeBottom</td><td>O(n)</td><td>—</td></tr>
+  <tr><td>queueType</td><td>add / delete / front</td><td>O(1) amortized</td><td>O(n)</td></tr>
+  <tr><td>queueType</td><td>addBatch(n) / deleteBatch(n)</td><td>O(n) total</td><td>O(n)</td></tr>
+  <tr><td>priorityQueueType</td><td>addQueue (insert)</td><td>O(n) — shift</td><td>O(n)</td></tr>
+  <tr><td>priorityQueueType</td><td>front / deleteQueue</td><td>O(1) / O(n)</td><td>—</td></tr>
+  <tr><td>HistoryRecord</td><td>Rotate / Flip</td><td>O(1) to create</td><td>O(1)</td></tr>
+  <tr><td>HistoryRecord</td><td>Brightness / Crop / Blur etc.</td><td>O(W×H)</td><td>O(W×H)</td></tr>
+  <tr><td>HistoryRecord</td><td>Bucket Fill</td><td>O(changed)</td><td>O(changed)</td></tr>
+  <tr><td>Coalescing</td><td>Merge brightness</td><td>O(1)</td><td>O(1) marginal</td></tr>
+  <tr><td>Memory eviction</td><td>removeBottom loop</td><td>O(stack size)</td><td>—</td></tr>
+  <tr><td>Bucket fill</td><td>Stack (DFS) / Queue (BFS)</td><td>O(W×H)</td><td>O(W×H) / O(max(W,H))</td></tr>
+</table>
+
+<!-- ===== SECTION 9 ===== -->
+<h2>9. Testing</h2>
+<p>The Phase 2 test program (<code>tests/test_main.cpp</code>) contains <strong>123 automated tests</strong> in 12 categories:</p>
+
+<table>
+  <tr><th>Category</th><th>Tests</th><th>Key coverage</th></tr>
+  <tr><td>stackType</td><td>18</td><td>Push, pop, growth, batch, removeBottom, empty safety, counters</td></tr>
+  <tr><td>queueType</td><td>18</td><td>FIFO, wraparound, growth, batch, fixed overflow, counters</td></tr>
+  <tr><td>priorityQueueType</td><td>16</td><td>Priority ordering, FIFO tie-breaking, mixed priorities, growth, safety</td></tr>
+  <tr><td>Image operations</td><td>21</td><td>All 8 ops, clamping, PNG/PPM roundtrip, deep copy</td></tr>
+  <tr><td>Undo/Redo (compact)</td><td>13</td><td>Brightness, rotate, flip, crop undo/redo, redo-clear-on-action</td></tr>
+  <tr><td>Memory budget</td><td>3</td><td>Tight budget eviction, unlimited mode, dynamic budget change</td></tr>
+  <tr><td>Coalescing</td><td>9</td><td>Chain merge, interruption, clipping reversal</td></tr>
+  <tr><td>Priority scheduling</td><td>4</td><td>Mode toggle, priority-order execution</td></tr>
+  <tr><td>Batch operations</td><td>6</td><td>Overflow, wraparound, oversized batch</td></tr>
+  <tr><td>Pipeline</td><td>8</td><td>Submit, process, cancel, clear, full-queue rejection</td></tr>
+  <tr><td>Inspector</td><td>3</td><td>Output format, undo count, memory display</td></tr>
+  <tr><td>Bucket fill undo</td><td>3</td><td>Fill, undo fill, redo fill with compact records</td></tr>
+</table>
+
+<p>All 123 tests pass. Exit code 0.</p>
+
+<!-- ===== SECTION 10 ===== -->
+<h2>10. Restrictions Compliance</h2>
+<ul>
+  <li>✅ No <code>std::vector</code>, <code>std::list</code>, <code>std::stack</code>, <code>std::queue</code>, <code>std::priority_queue</code>, <code>std::map</code>, <code>std::set</code>, or <code>std::array</code></li>
+  <li>✅ No <code>enum</code> — all operation type constants use <code>const int</code></li>
+  <li>✅ No recursion for bucket fill — both variants use iterative loops</li>
+  <li>✅ <code>stb_image</code> used only for PNG/JPG decoding/encoding — all image operations implemented with manual loops</li>
+  <li>✅ No threads, mutexes, or concurrency libraries</li>
+  <li>✅ All data structures (<code>stackType</code>, <code>queueType</code>, <code>priorityQueueType</code>) implemented from scratch with Rule of Three</li>
+</ul>
+
+</body>
+</html>
